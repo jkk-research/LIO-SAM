@@ -72,10 +72,10 @@ In these tests, the IMU was mounted on the bottom of the lidar such that their x
 Tested with ROS2 versions foxy and galactic on Ubuntu 20.04 and humble on Ubuntu 22.04
 - [ROS2](https://docs.ros.org/en/humble/Installation.html)
   ```
-  sudo apt install ros-<ros2-version>-perception-pcl \
-		   ros-<ros2-version>-pcl-msgs \
-		   ros-<ros2-version>-vision-opencv \
-		   ros-<ros2-version>-xacro
+  sudo apt install ros-$ROS_DISTRO-perception-pcl \
+		   ros-$ROS_DISTRO-pcl-msgs \
+		   ros-$ROS_DISTRO-vision-opencv \
+		   ros-$ROS_DISTRO-xacro
   ```
 - [gtsam](https://gtsam.org/get_started) (Georgia Tech Smoothing and Mapping library)
   ```
@@ -90,11 +90,9 @@ Use the following commands to download and compile the package.
 
   ```
   cd ~/ros2_ws/src
-  git clone https://github.com/TixiaoShan/LIO-SAM.git
-  cd LIO-SAM
-  git checkout ros2
-  cd ..
-  colcon build
+  git clone https://github.com/TixiaoShan/LIO-SAM -b ros2
+  cd ~/ros2_ws
+  colcon build --symlink-install --packages-select lio_sam
   ```
 
 ## Using Docker
