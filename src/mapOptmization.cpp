@@ -14,6 +14,10 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/inference/Symbol.h>
 
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.hpp>
+#include <tf2/exceptions.h>
+
 #include <gtsam/nonlinear/ISAM2.h>
 
 using namespace gtsam;
@@ -45,6 +49,48 @@ POINT_CLOUD_REGISTER_POINT_STRUCT (PointXYZIRPYT,
 
 typedef PointXYZIRPYT  PointTypePose;
 
+struct PointXYZRGBI
+{
+    PCL_ADD_POINT4D
+    PCL_ADD_RGB
+    float intensity;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZRGBI,
+                                   (float, x, x) (float, y, y) (float, z, z)
+                                   (float, rgb, rgb) (float, intensity, intensity))
+
+typedef PointXYZRGBI PointTypeRGB;
+
+struct CameraStreamState
+{
+    string imageTopic;
+    string infoTopic;
+    string frameId;
+    rclcpp::Time imageStamp;
+    sensor_msgs::msg::CameraInfo::ConstSharedPtr cameraInfo;
+    cv::Mat imageBgr;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr imageSub;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr infoSub;
+    mutable std::mutex mutex;
+};
+
+struct CameraSnapshot
+{
+    string frameId;
+    rclcpp::Time imageStamp;
+    sensor_msgs::msg::CameraInfo cameraInfo;
+    cv::Mat imageBgr;
+    Eigen::Affine3f lidarToCamera;
+};
+
+struct ColorizedCloudResult
+{
+    pcl::PointCloud<PointTypeRGB>::Ptr fullCloud;
+    pcl::PointCloud<PointTypeRGB>::Ptr coloredOnlyCloud;
+};
+
 
 class mapOptimization : public ParamServer
 {
@@ -69,6 +115,7 @@ public:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubIcpKeyFrames;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRecentKeyFrames;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRecentKeyFrame;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRecentKeyFrameColored;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubCloudRegisteredRaw;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubLoopConstraintEdge;
 
@@ -82,6 +129,7 @@ public:
 
     vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames;
     vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFrames;
+    vector<pcl::PointCloud<PointTypeRGB>::Ptr> coloredCloudKeyFrames;
     
     pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D;
     pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D;
@@ -104,8 +152,10 @@ public:
     std::vector<bool> laserCloudOriSurfFlag;
 
     map<int, pair<pcl::PointCloud<PointType>, pcl::PointCloud<PointType>>> laserCloudMapContainer;
+    map<int, pcl::PointCloud<PointTypeRGB>> coloredCloudMapContainer;
     pcl::PointCloud<PointType>::Ptr laserCloudCornerFromMap;
     pcl::PointCloud<PointType>::Ptr laserCloudSurfFromMap;
+    pcl::PointCloud<PointTypeRGB>::Ptr laserCloudColoredFromMap;
     pcl::PointCloud<PointType>::Ptr laserCloudCornerFromMapDS;
     pcl::PointCloud<PointType>::Ptr laserCloudSurfFromMapDS;
 
@@ -150,6 +200,10 @@ public:
     Eigen::Affine3f incrementalOdometryAffineBack;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> br;
+    std::unique_ptr<tf2_ros::Buffer> tfBuffer;
+    std::shared_ptr<tf2_ros::TransformListener> tfListener;
+
+    vector<std::shared_ptr<CameraStreamState>> cameraStreams;
 
     mapOptimization(const rclcpp::NodeOptions & options) : ParamServer("lio_sam_mapOptimization", options)
     {
@@ -165,6 +219,8 @@ public:
             "lio_sam/mapping/odometry_incremental", qos);
         pubPath = create_publisher<nav_msgs::msg::Path>("lio_sam/mapping/path", 1);
         br = std::make_unique<tf2_ros::TransformBroadcaster>(this);
+        tfBuffer = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tfListener = std::make_shared<tf2_ros::TransformListener>(*tfBuffer);
 
         subCloud = create_subscription<lio_sam::msg::CloudInfo>(
             "lio_sam/feature/cloud_info", qos,
@@ -227,7 +283,37 @@ public:
             *globalMapCloud += *globalCornerCloud;
             *globalMapCloud += *globalSurfCloud;
             int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);
-            res->success = ret == 0;
+
+            pcl::PointCloud<PointTypeRGB>::Ptr globalColoredCloud(new pcl::PointCloud<PointTypeRGB>());
+            pcl::PointCloud<PointTypeRGB>::Ptr globalColoredCloudDS(new pcl::PointCloud<PointTypeRGB>());
+            pcl::VoxelGrid<PointTypeRGB> downSizeFilterColored;
+
+            for (int i = 0; i < (int)cloudKeyPoses3D->size(); i++)
+            {
+                if (i >= (int)coloredCloudKeyFrames.size() || !coloredCloudKeyFrames[i])
+                    continue;
+
+                *globalColoredCloud += *transformColoredPointCloud(coloredCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
+            }
+
+            int coloredRet = -1;
+            if (globalColoredCloud->empty())
+            {
+                RCLCPP_WARN(get_logger(), "No colored points available to save.");
+            }
+            else if(req->resolution != 0)
+            {
+                downSizeFilterColored.setInputCloud(globalColoredCloud);
+                downSizeFilterColored.setLeafSize(req->resolution, req->resolution, req->resolution);
+                downSizeFilterColored.filter(*globalColoredCloudDS);
+                coloredRet = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMapColored.pcd", *globalColoredCloudDS);
+            }
+            else
+            {
+                coloredRet = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMapColored.pcd", *globalColoredCloud);
+            }
+
+            res->success = (ret == 0 && coloredRet == 0);
             downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
             downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
             cout << "****************************************************" << endl;
@@ -242,6 +328,7 @@ public:
 
         pubRecentKeyFrames = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/map_local", 1);
         pubRecentKeyFrame = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/cloud_registered", 1);
+        pubRecentKeyFrameColored = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/cloud_registered_colored", 1);
         pubCloudRegisteredRaw = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/cloud_registered_raw", 1);
 
         downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
@@ -249,7 +336,269 @@ public:
         downSizeFilterICP.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
+        initializeCameraSubscribers();
         allocateMemory();
+    }
+
+    void initializeCameraSubscribers()
+    {
+        if (cameraImageTopics.empty() || cameraInfoTopics.empty())
+            return;
+
+        const size_t cameraCount = std::min(cameraImageTopics.size(), cameraInfoTopics.size());
+        if (cameraImageTopics.size() != cameraInfoTopics.size())
+        {
+            RCLCPP_WARN(get_logger(), "cameraImageTopics (%zu) and cameraInfoTopics (%zu) size mismatch, using first %zu pairs.",
+                cameraImageTopics.size(), cameraInfoTopics.size(), cameraCount);
+        }
+
+        auto cameraQos = rclcpp::SensorDataQoS();
+        cameraStreams.reserve(cameraCount);
+        for (size_t i = 0; i < cameraCount; ++i)
+        {
+            auto camera = std::make_shared<CameraStreamState>();
+            camera->imageTopic = cameraImageTopics[i];
+            camera->infoTopic = cameraInfoTopics[i];
+
+            camera->imageSub = create_subscription<sensor_msgs::msg::Image>(
+                camera->imageTopic, cameraQos,
+                [this, camera](const sensor_msgs::msg::Image::ConstSharedPtr msg)
+                {
+                    cameraImageHandler(camera, msg);
+                });
+
+            camera->infoSub = create_subscription<sensor_msgs::msg::CameraInfo>(
+                camera->infoTopic, cameraQos,
+                [this, camera](const sensor_msgs::msg::CameraInfo::ConstSharedPtr msg)
+                {
+                    cameraInfoHandler(camera, msg);
+                });
+
+            cameraStreams.push_back(camera);
+        }
+
+        RCLCPP_INFO(get_logger(), "Initialized %zu camera stream(s) for point cloud coloring.", cameraStreams.size());
+        RCLCPP_INFO(get_logger(), "cameraColoringMaxTimeDiff=%.3f sec", cameraColoringMaxTimeDiff);
+    }
+
+    void cameraImageHandler(const std::shared_ptr<CameraStreamState>& camera, const sensor_msgs::msg::Image::ConstSharedPtr& msg)
+    {
+        try
+        {
+            cv_bridge::CvImageConstPtr cvPtr;
+            if (msg->encoding == sensor_msgs::image_encodings::BGR8)
+            {
+                cvPtr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+            }
+            else if (msg->encoding == sensor_msgs::image_encodings::RGB8)
+            {
+                cvPtr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::RGB8);
+            }
+            else if (msg->encoding == sensor_msgs::image_encodings::MONO8)
+            {
+                cvPtr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::MONO8);
+            }
+            else
+            {
+                cvPtr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+            }
+
+            cv::Mat imageBgr;
+            if (cvPtr->image.type() == CV_8UC3 && msg->encoding == sensor_msgs::image_encodings::RGB8)
+                cv::cvtColor(cvPtr->image, imageBgr, cv::COLOR_RGB2BGR);
+            else if (cvPtr->image.type() == CV_8UC1)
+                cv::cvtColor(cvPtr->image, imageBgr, cv::COLOR_GRAY2BGR);
+            else
+                imageBgr = cvPtr->image;
+
+            std::lock_guard<std::mutex> lock(camera->mutex);
+            camera->imageBgr = imageBgr.clone();
+            camera->imageStamp = msg->header.stamp;
+            if (!msg->header.frame_id.empty())
+                camera->frameId = msg->header.frame_id;
+        }
+        catch (const cv_bridge::Exception& exception)
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Failed to convert image on %s: %s", camera->imageTopic.c_str(), exception.what());
+        }
+    }
+
+    void cameraInfoHandler(const std::shared_ptr<CameraStreamState>& camera, const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg)
+    {
+        std::lock_guard<std::mutex> lock(camera->mutex);
+        camera->cameraInfo = msg;
+        if (!msg->header.frame_id.empty())
+            camera->frameId = msg->header.frame_id;
+    }
+
+    std::vector<CameraSnapshot> getCameraSnapshots(const rclcpp::Time& cloudStamp)
+    {
+        std::vector<CameraSnapshot> snapshots;
+        snapshots.reserve(cameraStreams.size());
+
+        for (const auto& camera : cameraStreams)
+        {
+            CameraSnapshot snapshot;
+            {
+                std::lock_guard<std::mutex> lock(camera->mutex);
+                if (!camera->cameraInfo || camera->imageBgr.empty())
+                    continue;
+
+                if (camera->frameId.empty())
+                {
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                        "Camera stream has no frame_id yet, cannot colorize cloud. image_topic=%s info_topic=%s",
+                        camera->imageTopic.c_str(), camera->infoTopic.c_str());
+                    continue;
+                }
+
+                const double imageAge = std::abs((cloudStamp - camera->imageStamp).seconds());
+                if (cameraColoringMaxTimeDiff > 0.0 && imageAge > cameraColoringMaxTimeDiff)
+                {
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                        "Camera image too old for cloud coloring: frame=%s age=%.3f sec limit=%.3f sec",
+                        camera->frameId.c_str(), imageAge, cameraColoringMaxTimeDiff);
+                    continue;
+                }
+
+                snapshot.frameId = camera->frameId;
+                snapshot.imageStamp = camera->imageStamp;
+                snapshot.cameraInfo = *camera->cameraInfo;
+                snapshot.imageBgr = camera->imageBgr.clone();
+            }
+
+            try
+            {
+                if (!tfBuffer->canTransform(snapshot.frameId, lidarFrame, tf2::TimePointZero, tf2::durationFromSec(0.0)))
+                {
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                        "No TF frame available for cloud coloring: source=%s target=%s",
+                        lidarFrame.c_str(), snapshot.frameId.c_str());
+                    continue;
+                }
+
+                const auto transform = tfBuffer->lookupTransform(snapshot.frameId, lidarFrame, tf2::TimePointZero);
+                snapshot.lidarToCamera = tf2::transformToEigen(transform.transform).cast<float>();
+                snapshots.push_back(std::move(snapshot));
+            }
+            catch (const tf2::TransformException& exception)
+            {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "No TF frame available for cloud coloring: source=%s target=%s error=%s",
+                    lidarFrame.c_str(), snapshot.frameId.c_str(), exception.what());
+            }
+        }
+
+        return snapshots;
+    }
+
+    ColorizedCloudResult colorizeCloudInLidarFrame(const pcl::PointCloud<PointType>::Ptr& cloudIn)
+    {
+        ColorizedCloudResult result;
+        result.fullCloud.reset(new pcl::PointCloud<PointTypeRGB>());
+        result.coloredOnlyCloud.reset(new pcl::PointCloud<PointTypeRGB>());
+        result.fullCloud->resize(cloudIn->size());
+
+        std::vector<uint8_t> pointColored(cloudIn->size(), 0);
+
+        #pragma omp parallel for num_threads(numberOfCores)
+        for (int i = 0; i < static_cast<int>(cloudIn->size()); ++i)
+        {
+            const auto& point = cloudIn->points[i];
+            auto& coloredPoint = result.fullCloud->points[i];
+            coloredPoint.x = point.x;
+            coloredPoint.y = point.y;
+            coloredPoint.z = point.z;
+            coloredPoint.intensity = point.intensity;
+            coloredPoint.r = 255;
+            coloredPoint.g = 255;
+            coloredPoint.b = 255;
+        }
+
+        const auto cameraSnapshots = getCameraSnapshots(timeLaserInfoStamp);
+        if (cameraSnapshots.empty())
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "No usable camera snapshots available for cloud coloring at stamp %.3f.",
+                timeLaserInfoStamp.seconds());
+            return result;
+        }
+
+        int coloredPointCount = 0;
+
+        #pragma omp parallel for num_threads(numberOfCores) reduction(+:coloredPointCount)
+        for (int i = 0; i < static_cast<int>(cloudIn->size()); ++i)
+        {
+            const auto& point = cloudIn->points[i];
+            auto& coloredPoint = result.fullCloud->points[i];
+
+            for (const auto& camera : cameraSnapshots)
+            {
+                const Eigen::Vector3f pointInCamera = camera.lidarToCamera * Eigen::Vector3f(point.x, point.y, point.z);
+                if (pointInCamera.z() <= 0.0f)
+                    continue;
+
+                const double fx = camera.cameraInfo.k[0];
+                const double fy = camera.cameraInfo.k[4];
+                const double cx = camera.cameraInfo.k[2];
+                const double cy = camera.cameraInfo.k[5];
+
+                const int pixelX = static_cast<int>(std::lround((fx * pointInCamera.x() / pointInCamera.z()) + cx));
+                const int pixelY = static_cast<int>(std::lround((fy * pointInCamera.y() / pointInCamera.z()) + cy));
+
+                if (pixelX < 0 || pixelY < 0 || pixelX >= camera.imageBgr.cols || pixelY >= camera.imageBgr.rows)
+                    continue;
+
+                const cv::Vec3b& pixel = camera.imageBgr.at<cv::Vec3b>(pixelY, pixelX);
+                coloredPoint.b = pixel[0];
+                coloredPoint.g = pixel[1];
+                coloredPoint.r = pixel[2];
+                pointColored[i] = 1;
+                break;
+            }
+
+            if (pointColored[i] != 0)
+                coloredPointCount += 1;
+        }
+
+        result.coloredOnlyCloud->reserve(coloredPointCount);
+        for (size_t i = 0; i < pointColored.size(); ++i)
+        {
+            if (pointColored[i] != 0)
+                result.coloredOnlyCloud->push_back(result.fullCloud->points[i]);
+        }
+
+        if (coloredPointCount == 0)
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "Cloud coloring colored 0/%zu points with %zu camera snapshot(s). TF may be non-optical or projection is outside image bounds.",
+                cloudIn->size(), cameraSnapshots.size());
+        }
+
+        return result;
+    }
+
+    pcl::PointCloud<PointTypeRGB>::Ptr transformColoredPointCloud(const pcl::PointCloud<PointTypeRGB>::Ptr& cloudIn, PointTypePose* transformIn)
+    {
+        pcl::PointCloud<PointTypeRGB>::Ptr cloudOut(new pcl::PointCloud<PointTypeRGB>());
+        cloudOut->resize(cloudIn->size());
+
+        Eigen::Affine3f transCur = pcl::getTransformation(transformIn->x, transformIn->y, transformIn->z, transformIn->roll, transformIn->pitch, transformIn->yaw);
+
+        #pragma omp parallel for num_threads(numberOfCores)
+        for (int i = 0; i < static_cast<int>(cloudIn->size()); ++i)
+        {
+            const auto& pointFrom = cloudIn->points[i];
+            auto& pointTo = cloudOut->points[i];
+            pointTo.x = transCur(0,0) * pointFrom.x + transCur(0,1) * pointFrom.y + transCur(0,2) * pointFrom.z + transCur(0,3);
+            pointTo.y = transCur(1,0) * pointFrom.x + transCur(1,1) * pointFrom.y + transCur(1,2) * pointFrom.z + transCur(1,3);
+            pointTo.z = transCur(2,0) * pointFrom.x + transCur(2,1) * pointFrom.y + transCur(2,2) * pointFrom.z + transCur(2,3);
+            pointTo.intensity = pointFrom.intensity;
+            pointTo.r = pointFrom.r;
+            pointTo.g = pointFrom.g;
+            pointTo.b = pointFrom.b;
+        }
+
+        return cloudOut;
     }
 
     void allocateMemory()
@@ -282,6 +631,7 @@ public:
 
         laserCloudCornerFromMap.reset(new pcl::PointCloud<PointType>());
         laserCloudSurfFromMap.reset(new pcl::PointCloud<PointType>());
+        laserCloudColoredFromMap.reset(new pcl::PointCloud<PointTypeRGB>());
         laserCloudCornerFromMapDS.reset(new pcl::PointCloud<PointType>());
         laserCloudSurfFromMapDS.reset(new pcl::PointCloud<PointType>());
 
@@ -902,7 +1252,8 @@ public:
     {
         // fuse the map
         laserCloudCornerFromMap->clear();
-        laserCloudSurfFromMap->clear(); 
+        laserCloudSurfFromMap->clear();
+        laserCloudColoredFromMap->clear();
         for (int i = 0; i < (int)cloudToExtract->size(); ++i)
         {
             if (pointDistance(cloudToExtract->points[i], cloudKeyPoses3D->back()) > surroundingKeyframeSearchRadius)
@@ -914,13 +1265,26 @@ public:
                 // transformed cloud available
                 *laserCloudCornerFromMap += laserCloudMapContainer[thisKeyInd].first;
                 *laserCloudSurfFromMap   += laserCloudMapContainer[thisKeyInd].second;
-            } else {
+            }
+            else
+            {
                 // transformed cloud not available
                 pcl::PointCloud<PointType> laserCloudCornerTemp = *transformPointCloud(cornerCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
                 pcl::PointCloud<PointType> laserCloudSurfTemp = *transformPointCloud(surfCloudKeyFrames[thisKeyInd],    &cloudKeyPoses6D->points[thisKeyInd]);
                 *laserCloudCornerFromMap += laserCloudCornerTemp;
                 *laserCloudSurfFromMap   += laserCloudSurfTemp;
                 laserCloudMapContainer[thisKeyInd] = make_pair(laserCloudCornerTemp, laserCloudSurfTemp);
+            }
+
+            if (coloredCloudMapContainer.find(thisKeyInd) != coloredCloudMapContainer.end())
+            {
+                *laserCloudColoredFromMap += coloredCloudMapContainer[thisKeyInd];
+            }
+            else if (thisKeyInd < (int)coloredCloudKeyFrames.size())
+            {
+                pcl::PointCloud<PointTypeRGB> laserCloudColoredTemp = *transformColoredPointCloud(coloredCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd]);
+                *laserCloudColoredFromMap += laserCloudColoredTemp;
+                coloredCloudMapContainer[thisKeyInd] = laserCloudColoredTemp;
             }
             
         }
@@ -937,6 +1301,10 @@ public:
         // clear map cache if too large
         if (laserCloudMapContainer.size() > 1000)
             laserCloudMapContainer.clear();
+        if (coloredCloudMapContainer.size() > 1000)
+            coloredCloudMapContainer.clear();
+                coloredCloudMapContainer.clear();
+                coloredCloudMapContainer.clear();
     }
 
     void extractSurroundingKeyFrames()
@@ -1571,12 +1939,17 @@ public:
         // save all the received edge and surf points
         pcl::PointCloud<PointType>::Ptr thisCornerKeyFrame(new pcl::PointCloud<PointType>());
         pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr thisFullKeyFrame(new pcl::PointCloud<PointType>());
         pcl::copyPointCloud(*laserCloudCornerLastDS,  *thisCornerKeyFrame);
         pcl::copyPointCloud(*laserCloudSurfLastDS,    *thisSurfKeyFrame);
+        *thisFullKeyFrame += *thisCornerKeyFrame;
+        *thisFullKeyFrame += *thisSurfKeyFrame;
+        ColorizedCloudResult colorizedKeyFrame = colorizeCloudInLidarFrame(thisFullKeyFrame);
 
         // save key frame cloud
         cornerCloudKeyFrames.push_back(thisCornerKeyFrame);
         surfCloudKeyFrames.push_back(thisSurfKeyFrame);
+        coloredCloudKeyFrames.push_back(colorizedKeyFrame.coloredOnlyCloud);
 
         // save path for visualization
         updatePath(thisPose6D);
@@ -1726,12 +2099,16 @@ public:
         // publish registered key frame
         if (pubRecentKeyFrame->get_subscription_count() != 0)
         {
-            pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<PointType>::Ptr cloudIn(new pcl::PointCloud<PointType>());
+            *cloudIn += *laserCloudCornerLastDS;
+            *cloudIn += *laserCloudSurfLastDS;
+
             PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
-            *cloudOut += *transformPointCloud(laserCloudCornerLastDS,  &thisPose6D);
-            *cloudOut += *transformPointCloud(laserCloudSurfLastDS,    &thisPose6D);
+            pcl::PointCloud<PointType>::Ptr cloudOut = transformPointCloud(cloudIn, &thisPose6D);
             publishCloud(pubRecentKeyFrame, cloudOut, timeLaserInfoStamp, odometryFrame);
         }
+        if (pubRecentKeyFrameColored->get_subscription_count() != 0)
+            publishCloud(pubRecentKeyFrameColored, laserCloudColoredFromMap, timeLaserInfoStamp, odometryFrame);
         // publish registered high-res raw cloud
         if (pubCloudRegisteredRaw->get_subscription_count() != 0)
         {

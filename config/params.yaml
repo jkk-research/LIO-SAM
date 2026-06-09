@@ -2,14 +2,17 @@
   ros__parameters:
 
     # Topics
-    pointCloudTopic: "/points"                   # Point cloud data
-    imuTopic: "/imu/data"                        # IMU data
-    odomTopic: "odometry/imu"                    # IMU pre-preintegration odometry, same frequency as IMU
-    gpsTopic: "odometry/gpsz"                    # GPS odometry topic from navsat, see module_navsat.launch file
+    pointCloudTopic: "/lexus3/os_center/points"          # Point cloud data
+    imuTopic: "/imu/data"                                         # IMU data
+    odomTopic: "/odometry/imu"                                    # IMU pre-preintegration odometry, same frequency as IMU
+    gpsTopic: "/lexus3/gps/nova/current_pose"                   # GPS odometry topic from navsat, see module_navsat.launch file
+    cameraImageTopics: ["/lexus3/camera/camera0/image_rect_color", "/lexus3/camera/camera1/image_rect_color"]
+    cameraInfoTopics: ["/lexus3/camera/camera0/camera_info", "/lexus3/camera/camera1/camera_info"]
+    cameraColoringMaxTimeDiff: 2.0
 
     # Frames
-    lidarFrame: "lidar_link"
-    baselinkFrame: "base_link"
+    lidarFrame: "lexus3/os_center"
+    baselinkFrame: "lexus3/base_link"
     odometryFrame: "odom"
     mapFrame: "map"
 
@@ -21,16 +24,16 @@
 
     # Export settings
     savePCD: false                               # https://github.com/TixiaoShan/LIO-SAM/issues/3
-    savePCDDirectory: "/Downloads/LOAM/"         # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
+    savePCDDirectory: "/liosam/"         # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
 
     # Sensor Settings
     sensor: ouster                               # lidar sensor type, either 'velodyne', 'ouster' or 'livox'
     N_SCAN: 64                                   # number of lidar channels (i.e., Velodyne/Ouster: 16, 32, 64, 128, Livox Horizon: 6)
-    Horizon_SCAN: 512                            # lidar horizontal resolution (Velodyne:1800, Ouster:512,1024,2048, Livox Horizon: 4000)
+    Horizon_SCAN: 1024                            # lidar horizontal resolution (Velodyne:1800, Ouster:512,1024,2048, Livox Horizon: 4000)
     downsampleRate: 1                            # default: 1. Downsample your data if too many
     # points. i.e., 16 = 64 / 4, 16 = 16 / 1
-    lidarMinRange: 1.0                           # default: 1.0, minimum lidar range to be used
-    lidarMaxRange: 1000.0                        # default: 1000.0, maximum lidar range to be used
+    lidarMinRange: 3.0                           # default: 1.0, minimum lidar range to be used
+    lidarMaxRange: 80.0                        # default: 1000.0, maximum lidar range to be used
 
     # IMU Settings
     imuAccNoise: 3.9939570888238808e-03
@@ -39,15 +42,15 @@
     imuGyrBiasN: 3.5640318696367613e-05
 
     imuGravity: 9.80511
-    imuRPYWeight: 0.01
+    imuRPYWeight: 0.001
 
-    extrinsicTrans:  [ 0.0,  0.0,  0.0 ]
-    extrinsicRot:    [-1.0,  0.0,  0.0,
-                       0.0,  1.0,  0.0,
-                       0.0,  0.0, -1.0 ]
-    extrinsicRPY: [ 0.0,  1.0,  0.0,
-                   -1.0,  0.0,  0.0,
-                    0.0,  0.0,  1.0 ]
+    extrinsicTrans:  [ 0.0,  0.0,  0.08 ]
+    extrinsicRot: [1.0,  0.0,  0.0,
+                    0.0,  1.0,  0.0,
+                    0.0,  0.0, 1.0]
+    extrinsicRPY: [1.0, 0.0,  0.0,
+                    0.0, 1.0, 0.0,
+                    0.0,  0.0,  1.0]
 
     # LOAM feature threshold
     edgeThreshold: 1.0
@@ -65,13 +68,13 @@
     rotation_tollerance: 1000.0                   # radians
 
     # CPU Params
-    numberOfCores: 4                              # number of cores for mapping optimization
+    numberOfCores: 8                              # number of cores for mapping optimization
     mappingProcessInterval: 0.15                  # seconds, regulate mapping frequency
 
     # Surrounding map
     surroundingkeyframeAddingDistThreshold: 1.0   # meters, regulate keyframe adding threshold
     surroundingkeyframeAddingAngleThreshold: 0.2  # radians, regulate keyframe adding threshold
-    surroundingKeyframeDensity: 2.0               # meters, downsample surrounding keyframe poses   
+    surroundingKeyframeDensity: 2.0               # meters, downsample surrounding keyframe poses
     surroundingKeyframeSearchRadius: 50.0         # meters, within n meters scan-to-map optimization
     # (when loop closure disabled)
 
@@ -91,3 +94,5 @@
     globalMapVisualizationSearchRadius: 1000.0    # meters, global map visualization radius
     globalMapVisualizationPoseDensity: 10.0       # meters, global map visualization keyframe density
     globalMapVisualizationLeafSize: 1.0           # meters, global map visualization cloud density
+    #Color Cloud
+   

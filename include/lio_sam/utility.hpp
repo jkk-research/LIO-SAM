@@ -8,6 +8,8 @@
 #include <std_msgs/msg/header.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
@@ -74,6 +76,9 @@ public:
     string imuTopic;
     string odomTopic;
     string gpsTopic;
+    vector<string> cameraImageTopics;
+    vector<string> cameraInfoTopics;
+    double cameraColoringMaxTimeDiff;
 
     //Frames
     string lidarFrame;
@@ -162,6 +167,12 @@ public:
         get_parameter("odomTopic", odomTopic);
         declare_parameter("gpsTopic", "lio_sam/odometry/gps");
         get_parameter("gpsTopic", gpsTopic);
+        declare_parameter("cameraImageTopics", vector<string>{});
+        get_parameter("cameraImageTopics", cameraImageTopics);
+        declare_parameter("cameraInfoTopics", vector<string>{});
+        get_parameter("cameraInfoTopics", cameraInfoTopics);
+        declare_parameter("cameraColoringMaxTimeDiff", 2.0);
+        get_parameter("cameraColoringMaxTimeDiff", cameraColoringMaxTimeDiff);
 
         declare_parameter("lidarFrame", "laser_data_frame");
         get_parameter("lidarFrame", lidarFrame);
@@ -345,7 +356,8 @@ public:
 };
 
 
-sensor_msgs::msg::PointCloud2 publishCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub, pcl::PointCloud<PointType>::Ptr thisCloud, rclcpp::Time thisStamp, std::string thisFrame)
+template <typename PointCloudPtrT>
+sensor_msgs::msg::PointCloud2 publishCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub, const PointCloudPtrT& thisCloud, rclcpp::Time thisStamp, std::string thisFrame)
 {
     sensor_msgs::msg::PointCloud2 tempCloud;
     pcl::toROSMsg(*thisCloud, tempCloud);
