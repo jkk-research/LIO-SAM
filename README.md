@@ -181,6 +181,24 @@ ros2 launch lio_sam run.launch.py
 ros2 bag play your-bag.bag
 ```
 
+## Colored point cloud support
+
+This ROS2 branch can optionally colorize lidar points from one or more RGB cameras in `mapOptimization.cpp`.
+
+- Configure the camera topics in `config/params.yaml`:
+  - `cameraImageTopics`: list of RGB image topics
+  - `cameraInfoTopics`: list of matching camera info topics
+  - `cameraColoringMaxTimeDiff`: maximum allowed time difference between a lidar scan and the cached camera image
+- The node uses the `camera_info.header.frame_id` frame together with the configured `lidarFrame` and expects a valid TF chain between them.
+- The camera frame used for projection should be an optical camera frame. If a non-optical `*_link` frame is used, projection can succeed poorly or color no points at all.
+
+Published topics:
+
+- `/lio_sam/mapping/cloud_registered`: full registered lidar cloud without RGB fields
+- `/lio_sam/mapping/cloud_registered_colored`: colored local map built from surrounding keyframes, containing only points that were successfully colorized from camera images
+
+If no usable camera image is available for a scan, the normal lidar map continues to run and the node reports runtime warnings about stale images, missing frames, missing TF, or zero colored points.
+
 ## Save map
 ```
 ros2 service call /lio_sam/save_map lio_sam/srv/SaveMap
@@ -188,6 +206,22 @@ ros2 service call /lio_sam/save_map lio_sam/srv/SaveMap
 ```
 ros2 service call /lio_sam/save_map lio_sam/srv/SaveMap "{resolution: 0.2, destination: /Downloads/service_LOAM}"
 ```
+
+The `destination` field is interpreted relative to `$HOME`. For example, `destination: /Downloads/service_LOAM` saves into `$HOME/Downloads/service_LOAM`.
+
+The `save_map` service now exports both the standard map and the colored map into the same target directory:
+
+- `trajectory.pcd`
+- `transformations.pcd`
+- `CornerMap.pcd`
+- `SurfMap.pcd`
+- `GlobalMap.pcd`
+- `GlobalMapColored.pcd`
+- `GlobalMapColoredGlobal.pcd`
+
+`GlobalMapColored.pcd` stays in the local LIO-SAM map frame. If GPS has already been accepted and anchored, `GlobalMapColoredGlobal.pcd` is also written with the colored cloud shifted into the absolute GPS coordinate system using the first accepted GPS fix as the origin reference.
+
+Before writing, the service deletes and recreates the target directory.
 ## Other notes
 
   - **Loop closure:** The loop function here gives an example of proof of concept. It is directly adapted from LeGO-LOAM loop closure. For more advanced loop closure implementation, please refer to [ScanContext](https://github.com/irapkaist/SC-LeGO-LOAM). Set the "loopClosureEnableFlag" in "params.yaml" to "true" to test the loop closure function. In Rviz, uncheck "Map (cloud)" and check "Map (global)". This is because the visualized map - "Map (cloud)" - is simply a stack of point clouds in Rviz. Their postion will not be updated after pose correction. The loop closure function here is simply adapted from LeGO-LOAM, which is an ICP-based method. Because ICP runs pretty slow, it is suggested that the playback speed is set to be "-r 1". You can try the Garden dataset for testing.

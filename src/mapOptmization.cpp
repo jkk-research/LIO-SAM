@@ -18,6 +18,8 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <tf2/exceptions.h>
 
+#include <cmath>
+
 #include <gtsam/nonlinear/ISAM2.h>
 
 using namespace gtsam;
@@ -90,6 +92,12 @@ struct ColorizedCloudResult
     pcl::PointCloud<PointTypeRGB>::Ptr fullCloud;
     pcl::PointCloud<PointTypeRGB>::Ptr coloredOnlyCloud;
 };
+
+template <typename PointT>
+bool isFinitePointXYZ(const PointT& point)
+{
+    return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
+}
 
 
 class mapOptimization : public ParamServer
@@ -187,6 +195,14 @@ public:
     int laserCloudSurfLastDSNum = 0;
 
     bool aLoopIsClosed = false;
+    bool gpsUsageInfoPrinted = false;
+    bool gpsReferenceInitialized = false;
+    double gpsReferenceRawX = 0.0;
+    double gpsReferenceRawY = 0.0;
+    double gpsReferenceRawZ = 0.0;
+    double gpsReferenceLocalX = 0.0;
+    double gpsReferenceLocalY = 0.0;
+    double gpsReferenceLocalZ = 0.0;
     map<int, int> loopIndexContainer; // from new to old
     vector<pair<int, int>> loopIndexQueue;
     vector<gtsam::Pose3> loopPoseQueue;
@@ -313,7 +329,35 @@ public:
                 coloredRet = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMapColored.pcd", *globalColoredCloud);
             }
 
-            res->success = (ret == 0 && coloredRet == 0);
+            int coloredGlobalRet = 0;
+            if (gpsReferenceInitialized && !globalColoredCloud->empty())
+            {
+                const float globalXOffset = static_cast<float>(gpsReferenceRawX - gpsReferenceLocalX);
+                const float globalYOffset = static_cast<float>(gpsReferenceRawY - gpsReferenceLocalY);
+                const float globalZOffset = static_cast<float>(gpsReferenceRawZ - gpsReferenceLocalZ);
+
+                pcl::PointCloud<PointTypeRGB>::Ptr globalColoredCloudAbsolute =
+                    translateColoredPointCloud(globalColoredCloud, globalXOffset, globalYOffset, globalZOffset);
+                pcl::PointCloud<PointTypeRGB>::Ptr globalColoredCloudAbsoluteDS(new pcl::PointCloud<PointTypeRGB>());
+
+                if(req->resolution != 0)
+                {
+                    downSizeFilterColored.setInputCloud(globalColoredCloudAbsolute);
+                    downSizeFilterColored.setLeafSize(req->resolution, req->resolution, req->resolution);
+                    downSizeFilterColored.filter(*globalColoredCloudAbsoluteDS);
+                    coloredGlobalRet = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMapColoredGlobal.pcd", *globalColoredCloudAbsoluteDS);
+                }
+                else
+                {
+                    coloredGlobalRet = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMapColoredGlobal.pcd", *globalColoredCloudAbsolute);
+                }
+            }
+            else if (!gpsReferenceInitialized)
+            {
+                RCLCPP_WARN(get_logger(), "Skipping absolute colored map export because no GPS reference has been initialized yet.");
+            }
+
+            res->success = (ret == 0 && coloredRet == 0 && coloredGlobalRet == 0);
             downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
             downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
             cout << "****************************************************" << endl;
@@ -681,6 +725,34 @@ public:
         }
     }
 
+    pcl::PointCloud<PointTypeRGB>::Ptr translateColoredPointCloud(const pcl::PointCloud<PointTypeRGB>::Ptr& cloudIn,
+                                                                  float xOffset,
+                                                                  float yOffset,
+                                                                  float zOffset)
+    {
+        pcl::PointCloud<PointTypeRGB>::Ptr cloudOut(new pcl::PointCloud<PointTypeRGB>());
+
+        if (!cloudIn)
+            return cloudOut;
+
+        cloudOut->resize(cloudIn->size());
+        cloudOut->is_dense = cloudIn->is_dense;
+        cloudOut->height = cloudIn->height;
+        cloudOut->width = cloudIn->width;
+
+        for (size_t i = 0; i < cloudIn->size(); ++i)
+        {
+            const PointTypeRGB& pointFrom = cloudIn->points[i];
+            PointTypeRGB& pointTo = cloudOut->points[i];
+            pointTo = pointFrom;
+            pointTo.x += xOffset;
+            pointTo.y += yOffset;
+            pointTo.z += zOffset;
+        }
+
+        return cloudOut;
+    }
+
     void gpsHandler(const nav_msgs::msg::Odometry::SharedPtr gpsMsg)
     {
         gpsQueue.push_back(*gpsMsg);
@@ -807,6 +879,13 @@ public:
         std::vector<float> pointSearchSqDisGlobalMap;
         // search near key frames to visualize
         mtx.lock();
+        if (!isFinitePointXYZ(cloudKeyPoses3D->back()))
+        {
+            mtx.unlock();
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                "Skipping global map publish because the latest key pose is invalid.");
+            return;
+        }
         kdtreeGlobalMap->setInputCloud(cloudKeyPoses3D);
         kdtreeGlobalMap->radiusSearch(cloudKeyPoses3D->back(), globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
         mtx.unlock();
@@ -820,7 +899,10 @@ public:
         downSizeFilterGlobalMapKeyPoses.filter(*globalMapKeyPosesDS);
         for(auto& pt : globalMapKeyPosesDS->points)
         {
-            kdtreeGlobalMap->nearestKSearch(pt, 1, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap);
+            if (!isFinitePointXYZ(pt))
+                continue;
+            if (kdtreeGlobalMap->nearestKSearch(pt, 1, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap) <= 0)
+                continue;
             pt.intensity = cloudKeyPoses3D->points[pointSearchIndGlobalMap[0]].intensity;
         }
 
@@ -1219,6 +1301,12 @@ public:
         std::vector<float> pointSearchSqDis;
 
         // extract all the nearby key poses and downsample them
+        if (!isFinitePointXYZ(cloudKeyPoses3D->back()))
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                "Skipping surrounding keyframe extraction because the latest key pose is invalid.");
+            return;
+        }
         kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D); // create kd-tree
         kdtreeSurroundingKeyPoses->radiusSearch(cloudKeyPoses3D->back(), (double)surroundingKeyframeSearchRadius, pointSearchInd, pointSearchSqDis);
         for (int i = 0; i < (int)pointSearchInd.size(); ++i)
@@ -1231,7 +1319,10 @@ public:
         downSizeFilterSurroundingKeyPoses.filter(*surroundingKeyPosesDS);
         for(auto& pt : surroundingKeyPosesDS->points)
         {
-            kdtreeSurroundingKeyPoses->nearestKSearch(pt, 1, pointSearchInd, pointSearchSqDis);
+            if (!isFinitePointXYZ(pt))
+                continue;
+            if (kdtreeSurroundingKeyPoses->nearestKSearch(pt, 1, pointSearchInd, pointSearchSqDis) <= 0)
+                continue;
             pt.intensity = cloudKeyPoses3D->points[pointSearchInd[0]].intensity;
         }
 
@@ -1809,17 +1900,43 @@ public:
                 float noise_z = thisGPS.pose.covariance[14];
                 if (noise_x > gpsCovThreshold || noise_y > gpsCovThreshold)
                     continue;
-                float gps_x = thisGPS.pose.pose.position.x;
-                float gps_y = thisGPS.pose.pose.position.y;
-                float gps_z = thisGPS.pose.pose.position.z;
+                double raw_gps_x = thisGPS.pose.pose.position.x;
+                double raw_gps_y = thisGPS.pose.pose.position.y;
+                double raw_gps_z = thisGPS.pose.pose.position.z;
                 if (!useGpsElevation)
                 {
-                    gps_z = transformTobeMapped[5];
+                    raw_gps_z = transformTobeMapped[5];
                     noise_z = 0.01;
                 }
 
                 // GPS not properly initialized (0,0,0)
-                if (abs(gps_x) < 1e-6 && abs(gps_y) < 1e-6)
+                if (abs(raw_gps_x) < 1e-6 && abs(raw_gps_y) < 1e-6)
+                    continue;
+
+                if (!std::isfinite(raw_gps_x) || !std::isfinite(raw_gps_y) || !std::isfinite(raw_gps_z))
+                    continue;
+
+                if (!gpsReferenceInitialized)
+                {
+                    gpsReferenceInitialized = true;
+                    gpsReferenceRawX = raw_gps_x;
+                    gpsReferenceRawY = raw_gps_y;
+                    gpsReferenceRawZ = raw_gps_z;
+                    gpsReferenceLocalX = transformTobeMapped[3];
+                    gpsReferenceLocalY = transformTobeMapped[4];
+                    gpsReferenceLocalZ = transformTobeMapped[5];
+
+                    RCLCPP_INFO(get_logger(),
+                        "Initialized GPS local reference. raw=(%.3f, %.3f, %.3f), local=(%.3f, %.3f, %.3f). Future GPS factors will use raw offsets anchored to the current local pose.",
+                        gpsReferenceRawX, gpsReferenceRawY, gpsReferenceRawZ,
+                        gpsReferenceLocalX, gpsReferenceLocalY, gpsReferenceLocalZ);
+                }
+
+                float gps_x = gpsReferenceLocalX + static_cast<float>(raw_gps_x - gpsReferenceRawX);
+                float gps_y = gpsReferenceLocalY + static_cast<float>(raw_gps_y - gpsReferenceRawY);
+                float gps_z = gpsReferenceLocalZ + static_cast<float>(raw_gps_z - gpsReferenceRawZ);
+
+                if (!std::isfinite(gps_x) || !std::isfinite(gps_y) || !std::isfinite(gps_z))
                     continue;
 
                 // Add GPS every a few meters
@@ -1835,6 +1952,16 @@ public:
                 gtsam::Vector Vector3(3);
                 Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
                 noiseModel::Diagonal::shared_ptr gps_noise = noiseModel::Diagonal::Variances(Vector3);
+
+                if (!gpsUsageInfoPrinted)
+                {
+                    RCLCPP_INFO(get_logger(),
+                        "GPS factor accepted from topic '%s'. frame_id='%s', child_frame_id='%s', raw_coordinates=(%.3f, %.3f, %.3f), local_coordinates=(%.3f, %.3f, %.3f), useGpsElevation=%s. Raw coordinates are converted to local offsets using the first accepted GPS sample; no TF conversion is applied.",
+                        gpsTopic.c_str(), thisGPS.header.frame_id.c_str(), thisGPS.child_frame_id.c_str(),
+                        raw_gps_x, raw_gps_y, raw_gps_z, gps_x, gps_y, gps_z, useGpsElevation ? "true" : "false");
+                    gpsUsageInfoPrinted = true;
+                }
+
                 gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
                 gtSAMgraph.add(gps_factor);
 
@@ -1907,6 +2034,18 @@ public:
         // cout << "****************************************************" << endl;
         // isamCurrentEstimate.print("Current estimate: ");
 
+        if (!std::isfinite(latestEstimate.translation().x()) ||
+            !std::isfinite(latestEstimate.translation().y()) ||
+            !std::isfinite(latestEstimate.translation().z()) ||
+            !std::isfinite(latestEstimate.rotation().roll()) ||
+            !std::isfinite(latestEstimate.rotation().pitch()) ||
+            !std::isfinite(latestEstimate.rotation().yaw()))
+        {
+            RCLCPP_ERROR(get_logger(),
+                "Skipping keyframe insertion because the optimized pose contains NaN or Inf values. Check GPS input alignment.");
+            return;
+        }
+
         thisPose3D.x = latestEstimate.translation().x();
         thisPose3D.y = latestEstimate.translation().y();
         thisPose3D.z = latestEstimate.translation().z();
@@ -1970,16 +2109,29 @@ public:
             int numPoses = isamCurrentEstimate.size();
             for (int i = 0; i < numPoses; ++i)
             {
-                cloudKeyPoses3D->points[i].x = isamCurrentEstimate.at<Pose3>(i).translation().x();
-                cloudKeyPoses3D->points[i].y = isamCurrentEstimate.at<Pose3>(i).translation().y();
-                cloudKeyPoses3D->points[i].z = isamCurrentEstimate.at<Pose3>(i).translation().z();
+                const Pose3 optimizedPose = isamCurrentEstimate.at<Pose3>(i);
+                if (!std::isfinite(optimizedPose.translation().x()) ||
+                    !std::isfinite(optimizedPose.translation().y()) ||
+                    !std::isfinite(optimizedPose.translation().z()) ||
+                    !std::isfinite(optimizedPose.rotation().roll()) ||
+                    !std::isfinite(optimizedPose.rotation().pitch()) ||
+                    !std::isfinite(optimizedPose.rotation().yaw()))
+                {
+                    RCLCPP_ERROR(get_logger(),
+                        "Skipping corrected pose update because optimized pose %d contains NaN or Inf values.", i);
+                    return;
+                }
+
+                cloudKeyPoses3D->points[i].x = optimizedPose.translation().x();
+                cloudKeyPoses3D->points[i].y = optimizedPose.translation().y();
+                cloudKeyPoses3D->points[i].z = optimizedPose.translation().z();
 
                 cloudKeyPoses6D->points[i].x = cloudKeyPoses3D->points[i].x;
                 cloudKeyPoses6D->points[i].y = cloudKeyPoses3D->points[i].y;
                 cloudKeyPoses6D->points[i].z = cloudKeyPoses3D->points[i].z;
-                cloudKeyPoses6D->points[i].roll  = isamCurrentEstimate.at<Pose3>(i).rotation().roll();
-                cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<Pose3>(i).rotation().pitch();
-                cloudKeyPoses6D->points[i].yaw   = isamCurrentEstimate.at<Pose3>(i).rotation().yaw();
+                cloudKeyPoses6D->points[i].roll  = optimizedPose.rotation().roll();
+                cloudKeyPoses6D->points[i].pitch = optimizedPose.rotation().pitch();
+                cloudKeyPoses6D->points[i].yaw   = optimizedPose.rotation().yaw();
 
                 updatePath(cloudKeyPoses6D->points[i]);
             }

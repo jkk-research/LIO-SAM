@@ -5,7 +5,7 @@
     pointCloudTopic: "/lexus3/os_center/points"          # Point cloud data
     imuTopic: "/imu/data"                                         # IMU data
     odomTopic: "/odometry/imu"                                    # IMU pre-preintegration odometry, same frequency as IMU
-    gpsTopic: "/lexus3/gps/nova/current_pose"                   # GPS odometry topic from navsat, see module_navsat.launch file
+    gpsTopic: "/novatel/oem7/odom"                   # GPS odometry topic from navsat, see module_navsat.launch file
     cameraImageTopics: ["/lexus3/camera/camera0/image_rect_color", "/lexus3/camera/camera1/image_rect_color"]
     cameraInfoTopics: ["/lexus3/camera/camera0/camera_info", "/lexus3/camera/camera1/camera_info"]
     cameraColoringMaxTimeDiff: 2.0
@@ -17,7 +17,7 @@
     mapFrame: "map"
 
     # GPS Settings
-    useImuHeadingInitialization: false           # if using GPS data, set to "true"
+    useImuHeadingInitialization: true           # if using GPS data, set to "true"
     useGpsElevation: false                       # if GPS elevation is bad, set to "false"
     gpsCovThreshold: 2.0                         # m^2, threshold for using GPS data
     poseCovThreshold: 25.0                       # m^2, threshold for using GPS data
@@ -32,7 +32,7 @@
     Horizon_SCAN: 1024                            # lidar horizontal resolution (Velodyne:1800, Ouster:512,1024,2048, Livox Horizon: 4000)
     downsampleRate: 1                            # default: 1. Downsample your data if too many
     # points. i.e., 16 = 64 / 4, 16 = 16 / 1
-    lidarMinRange: 3.0                           # default: 1.0, minimum lidar range to be used
+    lidarMinRange: 1.0                           # default: 1.0, minimum lidar range to be used
     lidarMaxRange: 80.0                        # default: 1000.0, maximum lidar range to be used
 
     # IMU Settings
